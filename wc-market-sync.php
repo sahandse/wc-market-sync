@@ -3,7 +3,7 @@
  * Plugin Name: همگام‌سازی بازار ووکامرس
  * Plugin URI: https://github.com/sahandse/wc-market-sync
  * Description: همگام‌سازی محصولات، قیمت، موجودی و سفارش‌های ووکامرس با باسلام و ترب.
- * Version: 1.0.0
+ * Version: 1.2.1
  * Author: Sahand Rezvan
  * Author URI: https://github.com/sahandse
  * Text Domain: wc-market-sync
@@ -15,7 +15,7 @@
 defined('ABSPATH') || exit;
 
 final class WCMS_Plugin {
-    const VERSION = '1.0.0';
+    const VERSION = '1.2.1';
     const OPTION  = 'wcms_settings';
 
     public function __construct() {
@@ -98,6 +98,10 @@ final class WCMS_Plugin {
     }
 
     public function admin_menu() {
+        if (function_exists('s_store_register_submenu')) {
+            s_store_register_submenu('wc-market-sync', 'همگام‌سازی بازار', [$this, 'settings_page'], 'manage_woocommerce', 'همگام‌سازی بازار');
+            return;
+        }
         add_submenu_page(
             'woocommerce',
             'همگام‌سازی بازار',
