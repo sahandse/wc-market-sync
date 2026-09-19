@@ -3,7 +3,7 @@
  * Plugin Name: همگام‌سازی بازار ووکامرس
  * Plugin URI: https://github.com/sahandse/wc-market-sync
  * Description: همگام‌سازی محصولات، قیمت، موجودی و سفارش‌های ووکامرس با باسلام و ترب.
- * Version: 1.2.1
+ * Version: 1.3.0
  * Author: Sahand Rezvan
  * Author URI: https://github.com/sahandse
  * Text Domain: wc-market-sync
@@ -15,7 +15,7 @@
 defined('ABSPATH') || exit;
 
 final class WCMS_Plugin {
-    const VERSION = '1.2.1';
+    const VERSION = '1.3.0';
     const OPTION  = 'wcms_settings';
 
     public function __construct() {
@@ -46,6 +46,8 @@ final class WCMS_Plugin {
         add_action('save_post_product', [$this, 'queue_product_sync'], 20, 3);
         add_action('woocommerce_product_set_stock', [$this, 'queue_stock_sync']);
         add_action('before_delete_post', [$this, 'queue_delete_sync']);
+        add_action('rest_api_init', [$this, 'register_rest_routes']);
+        add_action('admin_post_wcms_test_basalam', [$this, 'test_basalam']);
     }
 
     public function woocommerce_notice() {
@@ -67,6 +69,8 @@ final class WCMS_Plugin {
             'accent' => '#111827',
             'basalam_token' => '',
             'torob_key' => '',
+            'torob_feed_secret' => '',
+            'basalam_vendor_id' => '',
         ];
     }
 
@@ -94,6 +98,8 @@ final class WCMS_Plugin {
             'accent' => sanitize_hex_color($in['accent'] ?? '') ?: $d['accent'],
             'basalam_token' => sanitize_text_field($in['basalam_token'] ?? ''),
             'torob_key' => sanitize_text_field($in['torob_key'] ?? ''),
+            'torob_feed_secret' => sanitize_key($in['torob_feed_secret'] ?? '') ?: wp_generate_password(24,false,false),
+            'basalam_vendor_id' => absint($in['basalam_vendor_id'] ?? 0),
         ];
     }
 
@@ -122,6 +128,7 @@ final class WCMS_Plugin {
         $s = $this->settings();
         ?>
         <div class="wrap wcms-admin">
+            <?php if(!empty($_GET['wcms_notice'])):?><div class="notice notice-info"><p><?php echo esc_html(rawurldecode(sanitize_text_field(wp_unslash($_GET['wcms_notice'])))); ?></p></div><?php endif; ?>
             <div class="wcms-hero">
                 <div>
                     <h1>همگام‌سازی بازار ووکامرس</h1>
@@ -139,9 +146,13 @@ final class WCMS_Plugin {
                         <label>توکن باسلام
                             <input type="password" name="<?php echo self::OPTION; ?>[basalam_token]" value="<?php echo esc_attr($s['basalam_token']); ?>" autocomplete="off">
                         </label>
+                        <label>شناسه غرفه باسلام
+                            <input type="number" min="0" name="<?php echo self::OPTION; ?>[basalam_vendor_id]" value="<?php echo esc_attr($s['basalam_vendor_id']); ?>">
+                        </label>
                         <label>درصد تغییر قیمت باسلام
                             <input type="number" step="0.01" name="<?php echo self::OPTION; ?>[basalam_markup]" value="<?php echo esc_attr($s['basalam_markup']); ?>">
                         </label>
+                        <p><a class="button" href="<?php echo esc_url(wp_nonce_url(admin_url('admin-post.php?action=wcms_test_basalam'),'wcms_test_basalam')); ?>">تست اتصال باسلام</a></p>
 
                         <hr>
 
@@ -152,6 +163,10 @@ final class WCMS_Plugin {
                         <label>درصد تغییر قیمت ترب
                             <input type="number" step="0.01" name="<?php echo self::OPTION; ?>[torob_markup]" value="<?php echo esc_attr($s['torob_markup']); ?>">
                         </label>
+                        <label>Secret فید ترب
+                            <input type="text" name="<?php echo self::OPTION; ?>[torob_feed_secret]" value="<?php echo esc_attr($s['torob_feed_secret']); ?>">
+                        </label>
+                        <p><strong>آدرس فید ترب:</strong><br><code><?php echo esc_html(rest_url('wcms/v1/torob/products?key=' . ($s['torob_feed_secret'] ?: 'SAVE-FIRST'))); ?></code></p>
                     </section>
 
                     <section class="wcms-card">
@@ -182,7 +197,7 @@ final class WCMS_Plugin {
 
                     <section class="wcms-card wcms-wide">
                         <h2>منطق همگام‌سازی</h2>
-                        <p>ساختار صف همگام‌سازی برای تغییر محصول، موجودی و حذف آماده است. اتصال نهایی به API رسمی باسلام/ترب و نگاشت دسته‌بندی گرافیکی در نسخه‌های بعدی همین Repo تکمیل می‌شود.</p>
+                        <p>فید زنده محصولات ترب از WooCommerce فعال است و حذف/تغییر محصول در خروجی همان لحظه منعکس می‌شود. باسلام با Bearer Token رسمی تست و شناسایی غرفه می‌شود؛ نوشتن محصول در باسلام فقط پس از داشتن دسترسی OAuth مناسب انجام می‌شود.</p>
                     </section>
                 </div>
 
@@ -208,7 +223,120 @@ final class WCMS_Plugin {
             'product_id' => (int)$post_id,
             'time' => current_time('mysql'),
         ], false);
+    }    public function register_rest_routes() {
+        register_rest_route('wcms/v1','/torob/products',[
+            'methods'=>['GET','POST'],
+            'callback'=>[$this,'torob_products_endpoint'],
+            'permission_callback'=>'__return_true'
+        ]);
     }
+
+    private function torob_authorized(WP_REST_Request $request) {
+        $s=$this->settings();
+        $secret=(string)$s['torob_feed_secret'];
+        if(!$secret) return false;
+        $provided=(string)($request->get_param('key') ?: $request->get_header('X-WCMS-Key'));
+        return $provided && hash_equals($secret,$provided);
+    }
+
+    private function product_to_torob($product) {
+        $s=$this->settings();
+        $price=(float)$product->get_price();
+        $old=(float)$product->get_regular_price();
+        $markup=(float)$s['torob_markup'];
+        if($markup) { $price *= (1+$markup/100); if($old) $old *= (1+$markup/100); }
+        if('rial'===$s['currency_mode']) { $price*=10; if($old)$old*=10; }
+
+        $images=[];
+        if($product->get_image_id()) $images[]=wp_get_attachment_image_url($product->get_image_id(),'full');
+        foreach($product->get_gallery_image_ids() as $id){ $u=wp_get_attachment_image_url($id,'full'); if($u)$images[]=$u; }
+
+        $cats=wp_get_post_terms($product->get_id(),'product_cat',['fields'=>'names']);
+        $stock=$product->managing_stock() ? (int)$product->get_stock_quantity() : ($product->is_in_stock()?1:0);
+
+        return [
+            'page_unique'=>(string)$product->get_id(),
+            'page_url'=>get_permalink($product->get_id()),
+            'title'=>$product->get_name(),
+            'price'=>$price>0?(int)round($price):null,
+            'old_price'=>$old>$price?(int)round($old):null,
+            'availability'=>$product->is_in_stock(),
+            'stock'=>$stock,
+            'image_urls'=>array_values(array_filter($images)),
+            'category'=>is_array($cats)&&$cats?implode(' > ',$cats):'',
+            'date_added'=>get_post_time('c',true,$product->get_id()),
+            'date_updated'=>get_post_modified_time('c',true,$product->get_id()),
+            'product_group_id'=>$product->is_type('variation')?(string)$product->get_parent_id():null,
+            'sku'=>$product->get_sku(),
+        ];
+    }
+
+    public function torob_products_endpoint(WP_REST_Request $request) {
+        if(!$this->torob_authorized($request)) return new WP_REST_Response(['error'=>'unauthorized'],401);
+
+        $page=max(1,(int)($request->get_param('page')?:1));
+        $per_page=min(100,max(1,(int)($request->get_param('page_size')?:50)));
+        $unique=$request->get_param('page_unique');
+        $url=$request->get_param('page_url');
+
+        $args=['status'=>['publish'],'limit'=>$per_page,'page'=>$page,'paginate'=>true,'orderby'=>'date','order'=>'DESC'];
+        if($unique) $args['include']=[absint($unique)];
+        $result=wc_get_products($args);
+
+        $products=[];
+        foreach((array)$result->products as $product){
+            if($url && untrailingslashit(get_permalink($product->get_id()))!==untrailingslashit(esc_url_raw($url))) continue;
+            $products[]=$this->product_to_torob($product);
+            if('yes'===$this->settings()['sync_variations'] && $product->is_type('variable')){
+                foreach($product->get_children() as $vid){
+                    $v=wc_get_product($vid); if($v) $products[]=$this->product_to_torob($v);
+                }
+            }
+        }
+
+        return [
+            'count'=>(int)$result->total,
+            'page'=>$page,
+            'page_size'=>$per_page,
+            'has_more'=>$page < (int)$result->max_num_pages,
+            'products'=>$products,
+        ];
+    }
+
+    private function basalam_request($path,$method='GET',$body=null) {
+        $token=$this->settings()['basalam_token'];
+        if(!$token) return new WP_Error('wcms_basalam_auth','توکن باسلام وارد نشده است.');
+        $args=[
+            'method'=>$method,'timeout'=>20,
+            'headers'=>['Accept'=>'application/json','Authorization'=>'Bearer '.$token,'Content-Type'=>'application/json']
+        ];
+        if(null!==$body) $args['body']=wp_json_encode($body);
+        $res=wp_remote_request('https://core.basalam.com'.$path,$args);
+        if(is_wp_error($res)) return $res;
+        $code=(int)wp_remote_retrieve_response_code($res);
+        $json=json_decode(wp_remote_retrieve_body($res),true);
+        if($code<200||$code>=300) return new WP_Error('wcms_basalam_http','خطای باسلام HTTP '.$code);
+        return is_array($json)?$json:[];
+    }
+
+    public function test_basalam() {
+        if(!current_user_can('manage_woocommerce')) wp_die('دسترسی غیرمجاز');
+        check_admin_referer('wcms_test_basalam');
+        $data=$this->basalam_request('/v3/users/me');
+        if(is_wp_error($data)) $msg=$data->get_error_message();
+        else {
+            $vendor_id=(int)($data['vendor']['id']??0);
+            if($vendor_id){
+                $opt=(array)get_option(self::OPTION,[]);
+                $opt['basalam_vendor_id']=$vendor_id;
+                update_option(self::OPTION,$opt,false);
+            }
+            $msg='اتصال باسلام موفق است'.($vendor_id?' — غرفه #'.$vendor_id:'');
+        }
+        wp_safe_redirect(add_query_arg(['page'=>'wc-market-sync','wcms_notice'=>rawurlencode($msg)],admin_url('admin.php'))); exit;
+    }
+
+
 }
 
 new WCMS_Plugin();
